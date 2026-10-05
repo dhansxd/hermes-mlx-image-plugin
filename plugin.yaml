@@ -1,0 +1,5 @@
+name: mlx-image-gen
+version: 1.0.0
+description: Local MLX image generation on Apple Silicon via mflux (model from local cupboard, default flux2-klein-4b-4bit).
+author: dhansxd
+kind: backend

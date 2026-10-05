@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-mlx-image"
+version = "1.0.0"
+description = "Hermes Agent local MLX image-generation provider plugin (mflux)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "dhansxd" }]
+dependencies = []
+
+[project.entry-points."hermes_agent.plugins"]
+hermes_mlx_image = "hermes_mlx_image"
+
+[tool.setuptools.packages.find]
+where = ["src"]
