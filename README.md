@@ -24,15 +24,22 @@ To add a model later: append one dict row + alias lines. No other code changes n
 
 ## Install
 
-Copy (or symlink) this repo into your Hermes plugins directory as an `mlx-image-gen` backend:
+Install and enable through Hermes:
 
-```
-~/.hermes/plugins/mlx-image-gen/
-├── plugin.yaml
-└── __init__.py        (this repo's src/hermes_mlx_image/__init__.py)
+```bash
+hermes plugins install dhansxd/hermes-mlx-image-plugin --enable --yes-deps
+hermes plugins doctor mlx-image-gen --ci
 ```
 
-Or install the package and point `plugins.enabled` at it.
+Git installs include a root `__init__.py` that imports the implementation from
+`src/hermes_mlx_image`. No manual file copies or symlinks are required.
+Alternatively, copy the complete repository into `$HERMES_HOME/plugins/mlx-image-gen/`
+and enable `mlx-image-gen`. Do not enable the pip entry-point alias as well.
+
+The external wrapper keeps its own Python runtime. Before launching it, the
+plugin removes inherited `PYTHONPATH`, `PYTHONHOME`, and `VIRTUAL_ENV` from the
+child environment, preventing Hermes's Python packages from shadowing the MLX
+runtime. Other environment variables and the parent process remain unchanged.
 
 ## Configure
 

@@ -250,9 +250,15 @@ class MLXImageGenProvider(ImageGenProvider):
 
         logger.info(f"Running mflux command: {' '.join(shlex.quote(c) for c in command)}")
 
+        # External MLX runtime must not import Hermes's different Python ABI.
+        child_env = os.environ.copy()
+        for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+            child_env.pop(key, None)
+
         try:
             process = subprocess.run(
                 command,
+                env=child_env,
                 capture_output=True,
                 text=True,
                 check=True,

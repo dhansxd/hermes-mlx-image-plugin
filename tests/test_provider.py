@@ -109,6 +109,7 @@ def main() -> int:
 
     def fake_run(cmd, **kw):
         captured["cmd"] = list(cmd)
+        captured["env"] = kw.get("env", os.environ.copy())
         # Simulate wrapper writing the output file (last arg after --output).
         out = Path(cmd[cmd.index("--output") + 1])
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -123,13 +124,18 @@ def main() -> int:
     real_subprocess.run = fake_run
     os.path.isfile = lambda p: True if str(p).endswith("dyra-image") else orig_isfile(p)
     os.access = lambda p, m: True if str(p).endswith("dyra-image") else orig_access(p, m)
-    try:
-        mod2, provider2 = _load()
-        result = provider2.generate("a red apple", "square", resolution=256)
-    finally:
-        real_subprocess.run = orig_run
-        os.path.isfile = orig_isfile
-        os.access = orig_access
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"PYTHONPATH": "/hermes/python3.14", "PYTHONHOME": "/hermes", "VIRTUAL_ENV": "/hermes/venv", "MLX_TEST_KEEP": "yes"}):
+        try:
+            mod2, provider2 = _load()
+            result = provider2.generate("a red apple", "square", resolution=256)
+            assert not {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"} & captured["env"].keys(), "Python runtime environment leaked"
+            assert captured["env"]["MLX_TEST_KEEP"] == "yes"
+            assert os.environ["PYTHONPATH"] == "/hermes/python3.14"
+        finally:
+            real_subprocess.run = orig_run
+            os.path.isfile = orig_isfile
+            os.access = orig_access
 
     assert result["success"] is True, result
     assert result["provider"] == "mlx", result
@@ -149,6 +155,21 @@ def main() -> int:
         os.path.isfile = orig_isfile
         os.access = orig_access
     assert bad["success"] is False and bad["error_type"] == "input_image_not_found", bad
+
+    # Git installs must load register() from the repository root.
+    import importlib.util
+    root = Path(__file__).resolve().parents[1]
+    assert (root / "__init__.py").is_file(), "Git plugin root entry point missing"
+    spec = importlib.util.spec_from_file_location(
+        "mlx_plugin_install", root / "__init__.py", submodule_search_locations=[str(root)]
+    )
+    assert spec is not None and spec.loader is not None
+    installed = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = installed
+    spec.loader.exec_module(installed)
+    registered = []
+    installed.register(types.SimpleNamespace(register_image_gen_provider=registered.append))
+    assert len(registered) == 1 and registered[0].name == "mlx"
 
     print("ALL CHECKS PASSED")
     return 0
