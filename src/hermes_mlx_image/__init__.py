@@ -18,11 +18,11 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shlex
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from agent.image_gen_provider import ImageGenProvider, error_response, success_response
 from hermes_cli.plugins import PluginContext
@@ -50,6 +50,7 @@ _ALIASES: Dict[str, str] = {
 
 DEFAULT_MODELS_DIR = os.path.expanduser("~/.local/share/dyra-ai/models/image")
 DEFAULT_WRAPPER = os.path.expanduser("~/.local/bin/dyra-image")
+GENERATION_TIMEOUT_SECONDS = 1800
 
 
 def _load_settings() -> Dict[str, Any]:
@@ -208,6 +209,17 @@ class MLXImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect_ratio,
             )
 
+        local_model = Path(_models_dir(settings), entry["local_subdir"]).resolve()
+        if not local_model.is_dir():
+            return error_response(
+                error="The configured local model directory does not exist.",
+                error_type="model_not_found",
+                provider=self.name,
+                model=model_label,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+            )
+
         prompt, side = _resolution_request(prompt, kwargs)
         width, height = _dimensions(aspect_ratio, side)
         steps = _steps_for(side)
@@ -216,13 +228,13 @@ class MLXImageGenProvider(ImageGenProvider):
         image_cache_dir = os.path.join(get_hermes_home(), "cache", "images", "mlx")
         os.makedirs(image_cache_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"mlx_{timestamp}.png"
+        output_filename = f"mlx_{timestamp}_{uuid4().hex}.png"
         output_path = os.path.join(image_cache_dir, output_filename)
 
         # Base command from the generic table (NOT hardcoded per model).
         command = [
             wrapper,
-            "--model", entry["hf_id"],
+            "--model", str(local_model),
             "--base-model", entry["base_model"],
             "--quantize", entry["quantize"],
             "--steps", str(steps),
@@ -235,12 +247,11 @@ class MLXImageGenProvider(ImageGenProvider):
 
         # Handle Image-to-Image
         if image_url:
-            if os.path.exists(image_url):
-                command.extend(["--image-path", image_url])
-                command.extend(["--image-strength", "0.65"])
+            if os.path.isfile(image_url):
+                command.extend(["--image-paths", image_url])
             else:
                 return error_response(
-                    error=f"Input image does not exist: {image_url}",
+                    error="The input image does not exist.",
                     error_type="input_image_not_found",
                     provider=self.name,
                     model=model_label,
@@ -248,24 +259,25 @@ class MLXImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect_ratio,
                 )
 
-        logger.info(f"Running mflux command: {' '.join(shlex.quote(c) for c in command)}")
+        logger.info("Starting local MLX generation for %s (%dx%d, %d steps).", key, width, height, steps)
 
         # External MLX runtime must not import Hermes's different Python ABI.
         child_env = os.environ.copy()
         for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
             child_env.pop(key, None)
+        child_env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
 
         try:
-            process = subprocess.run(
+            subprocess.run(
                 command,
                 env=child_env,
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 check=True,
-                timeout=None,
+                timeout=GENERATION_TIMEOUT_SECONDS,
             )
 
-            if os.path.exists(output_path):
+            if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
                 return success_response(
                     image=output_path,
                     model=model_label,
@@ -276,10 +288,7 @@ class MLXImageGenProvider(ImageGenProvider):
                 )
             else:
                 return error_response(
-                    error=(
-                        "mflux command ran but output image missing. "
-                        f"STDOUT: {process.stdout} | STDERR: {process.stderr}"
-                    ),
+                    error="mflux finished without a usable output image.",
                     error_type="file_not_found",
                     provider=self.name,
                     model=model_label,
@@ -289,9 +298,9 @@ class MLXImageGenProvider(ImageGenProvider):
 
         except subprocess.CalledProcessError as e:
             error_msg = f"mflux command failed with exit code {e.returncode}."
-            logger.error(f"{error_msg} STDERR: {e.stderr} STDOUT: {e.stdout}")
+            logger.error(error_msg)
             return error_response(
-                error=f"{error_msg}\n---\nSTDERR:\n{e.stderr}\n---\nSTDOUT:\n{e.stdout}",
+                error=error_msg,
                 error_type="mflux_execution_failed",
                 provider=self.name,
                 model=model_label,
@@ -310,9 +319,9 @@ class MLXImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect_ratio,
             )
         except Exception as e:
-            logger.exception("An unexpected error occurred while running mflux.")
+            logger.error("An unexpected error occurred while running mflux (%s).", type(e).__name__)
             return error_response(
-                error=f"An unexpected error occurred: {str(e)}",
+                error="An unexpected error occurred while running mflux.",
                 error_type="unexpected_error",
                 provider=self.name,
                 model=model_label,
