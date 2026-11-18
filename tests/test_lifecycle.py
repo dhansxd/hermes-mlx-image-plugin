@@ -1,4 +1,6 @@
-"""Opt-in integration check against a real, pinned Hermes checkout.
+"""Deferred opt-in integration check against Hermes stable 0.23.2.
+
+Source reviewed for the pinned target; not executed during the 1.0.2 audit.
 
 Run this separately from the isolated provider unit tests, using a Python
 environment with Hermes's dependencies installed. No Hermes modules are stubbed.
@@ -20,7 +22,7 @@ import sys
 import tempfile
 
 
-HERMES_REVISION = "065f5abbb3c55d849ed7177ad5c1f231074b849a"
+HERMES_REVISION = "ae2a81ccc00e9b7c06301523e5bb09608397149c"
 PLUGIN_ID = "mlx-image-gen"
 
 
