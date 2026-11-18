@@ -217,16 +217,28 @@ def _remove_attempt_file(path: Optional[Path]) -> None:
         logger.warning("Could not remove an MLX attempt file.")
 
 
+def _remove_input_attempt(prefix: str) -> None:
+    """Native media helpers can fail after opening a file but before returning it."""
+    try:
+        cache = Path(get_hermes_home()) / "cache" / "generated" / "images"
+        for path in cache.glob(prefix + "_*"):
+            _remove_attempt_file(path)
+    except OSError:
+        logger.warning("Could not remove an MLX input attempt file.")
+
+
 def _source_image(value: Any) -> tuple[Path, bool]:
     """Materialize native URLs/data URLs through Hermes's public media helpers."""
     if not isinstance(value, str) or not value.strip():
         raise _RequestError("The source image must be a URL, data URL or absolute file path.", "invalid_input_image")
     value = value.strip()
     scheme = urlsplit(value).scheme.lower()
+    prefix = "mlx_input_" + uuid4().hex
     if scheme in ("http", "https"):
         try:
-            path = Path(save_url_image(value, prefix="mlx_input", max_bytes=MAX_INPUT_IMAGE_BYTES))
+            path = Path(save_url_image(value, prefix=prefix, max_bytes=MAX_INPUT_IMAGE_BYTES))
         except Exception:
+            _remove_input_attempt(prefix)
             raise _RequestError("Could not load the source image through Hermes URL safety.", "input_image_unavailable") from None
         owned = True
     elif scheme == "data":
@@ -238,8 +250,9 @@ def _source_image(value: Any) -> tuple[Path, bool]:
             if not raw or len(raw) > MAX_INPUT_IMAGE_BYTES:
                 raise ValueError
             extension = {"image/jpeg": "jpg", "image/jpg": "jpg"}.get(match.group(1).lower(), match.group(1).lower().split("/")[1])
-            path = Path(save_b64_image(match.group(2), prefix="mlx_input", extension=extension))
+            path = Path(save_b64_image(match.group(2), prefix=prefix, extension=extension))
         except Exception:
+            _remove_input_attempt(prefix)
             raise _RequestError("The image data URL is invalid or could not be cached.", "invalid_input_image") from None
         owned = True
     else:
@@ -294,10 +307,11 @@ class MLXImageGenProvider(ImageGenProvider):
         try:
             settings = _load_settings()
             wrapper = _wrapper_path(settings)
-            key = _default_key(settings)
+            root = _models_dir(settings)
+            # The native picker may override a stale provider-scoped default.
             return (
                 os.path.isfile(wrapper) and os.access(wrapper, os.X_OK)
-                and Path(_models_dir(settings), MODEL_TABLE[key]["local_subdir"]).is_dir()
+                and any(Path(root, entry["local_subdir"]).is_dir() for entry in MODEL_TABLE.values())
             )
         except Exception:
             return False
@@ -349,6 +363,8 @@ class MLXImageGenProvider(ImageGenProvider):
             if not local_model.is_dir():
                 raise _RequestError("The configured local model directory does not exist.", "model_not_found")
             prompt, side = _resolution_request(prompt, kwargs)
+            if not prompt.strip():
+                raise _RequestError("An image prompt is required after removing the size marker.", "invalid_request")
             width, height = _dimensions(aspect_ratio, side)
             steps = _steps_for(side)
             sources = []
@@ -356,7 +372,7 @@ class MLXImageGenProvider(ImageGenProvider):
                 source, owned = _source_image(image_url)
                 sources = ["--image-paths", str(source)]
                 input_path = source if owned else None
-            image_cache_dir = Path(get_hermes_home()) / "cache" / "generated" / "images"
+            image_cache_dir = Path(get_hermes_home()).resolve() / "cache" / "generated" / "images"
             image_cache_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = image_cache_dir / f"mlx_{timestamp}_{uuid4().hex}.png"
