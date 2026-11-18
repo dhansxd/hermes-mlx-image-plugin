@@ -1,152 +1,85 @@
 # hermes-mlx-image-plugin
 
-Local MLX image-generation backend plugin for [Hermes Agent](https://hermes-agent.nousresearch.com) that routes `image_generate` through a local `mflux` install on Apple Silicon.
+A selectable local image provider for [Hermes Agent](https://hermes-agent.nousresearch.com) on Apple Silicon. Hermes calls an external MFlux wrapper; it does not own or install the MLX runtime or weights.
 
-Generic by design: the provider name is `mlx` (not a model name). Models live in one local cupboard and are selected via config — adding a new model later is one row in `MODEL_TABLE`, not a new plugin.
+The manager ID is **mlx-image-gen**, the native image provider is **mlx**, and the optional pip entry-point ID remains **mlx-image-gen**. Models are entries in one table, not separate providers.
 
-## What it does
+## Install, enable and select
 
-- Text-to-image + local image-to-image edit (`image_url` → `--image-paths`)
-- Per-request resolution (`resolution`/`size` kwarg or `[size=NNN]` prompt marker, 256..1536, 16-aligned)
-- Aspect-ratio aware dimensions (`landscape` | `square` | `portrait`)
-- Quality step schedule by size (4 / 6 / 8 / 12)
-- Runs `~/.local/bin/dyra-image` with an existing, resolved local model directory and Hugging Face offline mode; missing weights fail without downloading
-- Unique output filenames, a 30-minute subprocess deadline, and errors/logs that omit prompts, private paths and raw runtime output
+Prepare the external runtime, wrapper and local model separately. This plugin downloads no models, installs no MLX dependencies and changes no Hermes core files. The manifest uses `python_runtime: external`.
 
-## Current model table (1 entry for now)
-
-| key | HF id | local subdir | base-model | quantize |
-|---|---|---|---|---|
-| `flux2-klein-4b-4bit` | `mlx-community/FLUX.2-Klein-4B-4bit` | `flux2-klein-4b-4bit` | `flux2-klein-4b` | `4` |
-
-The local subdirectory is relative to `models_dir` (default `~/.local/share/dyra-ai/models/image`).
-
-Aliases accepted for `model`: `flux2-klein-4b-4bit`, `flux2-klein-4b`, `mlx-community/FLUX.2-Klein-4B-4bit` (case-insensitive).
-
-To add a model later: append one dict row + alias lines. No other code changes needed.
-
-## Install
-
-First install the external Lemari/Dyra image runtime, executable wrapper and model
-weights on Apple Silicon. Hermes does not install MFlux, MLX, models or the wrapper:
-`python_runtime: external` keeps this plugin's packaging out of Hermes' Python
-dependency environment.
-
-Install through Hermes, then enable when ready:
+Use the official manager in the intended Hermes profile:
 
 ```bash
 hermes plugins install dhansxd/hermes-mlx-image-plugin --no-enable --yes-deps
 hermes plugins enable mlx-image-gen
-hermes plugins doctor mlx-image-gen --ci
+hermes tools
 ```
 
-Git installs include a root `__init__.py` that imports the implementation from
-`src/hermes_mlx_image`. No manual file copies or symlinks are required.
-The manifest ID is **`mlx-image-gen`**; the provider selected in `image_gen.provider`
-is **`mlx`**. Hermes publishes the Git install under
-`$HERMES_HOME/plugins/mlx-image-gen/` and records its source/revision in
-`plugins/.install-metadata.json`. Use the manifest ID for every lifecycle command,
-even though the GitHub repository has a different name.
+In **Image Generation**, select **MLX (local)** and its model. Enabling the plugin registers an option; it does not replace the selected image backend automatically. The equivalent config in the active profile's `config.yaml` is:
+
+```yaml
+image_gen:
+  provider: mlx
+  model: flux2-klein-4b-4bit
+  mlx:
+    # Optional provider default when no explicit/native model is passed:
+    model: flux2-klein-4b-4bit
+    models_dir: ~/.local/share/dyra-ai/models/image
+    wrapper: ~/.local/bin/dyra-image
+```
+
+Use absolute paths or `~/` paths on other machines. Tilde defaults resolve against the OS account home at call time, so Hermes profile homes do not create a second model cupboard. The wrapper and models may be placed elsewhere via config; existing local model symlinks are resolved rather than copied.
+
+Optional compatibility overrides are `MLX_IMAGE_MODEL`, `MLX_MODELS_DIR` and `MLX_WRAPPER`. Config wins over these overrides, which are read through Hermes's active profile scope. Prefer YAML for non-secret settings. Explicit models passed by the native picker/API win over the provider default; unknown models and malformed config fail clearly instead of generating with another model.
+
+Git installs use the root `__init__.py` shim. Hermes publishes the tree under `$HERMES_HOME/plugins/mlx-image-gen/` and owns its source/revision metadata. Do not install both a Git directory and a pip package. Older pip installations with the `hermes_mlx_image` alias need to be removed using `pip uninstall hermes-mlx-image` in their owning environment; directory removal does not uninstall pip distributions.
+
+## Update, disable and remove
 
 ```bash
+hermes plugins update mlx-image-gen
 hermes plugins disable mlx-image-gen
 hermes plugins enable mlx-image-gen
-hermes plugins update mlx-image-gen
 hermes plugins disable mlx-image-gen
 hermes plugins remove mlx-image-gen
 ```
 
-Hermes discovers metadata without activating this backend. Only Hermes calls
-`register(ctx)` after enablement; `ctx.register_image_gen_provider` gives Hermes
-ownership of the registration and cleanup on unload/rediscovery. There are no
-plugin install/uninstall hooks or registry mutations at import time. Disable
-before removing from a running gateway: the tested host's remove command deletes
-the install/config record but does not itself reload an already-running manager.
-Use the host's reload/restart if its disable output requests it.
-After removal, select another `image_gen.provider` if it still points to `mlx`;
-Hermes does not choose a replacement image backend for you.
+All commands use the manifest ID, not the repository name. An unpinned Git install follows its recorded source. For a reproducible install, use `--ref <full-40-character-commit-SHA>`; move an existing pin with an explicit forced install at the new SHA. The official manager owns update admission, backups and rollback.
 
-An unpinned Git install updates through its saved source. To pin a reproducible
-version, add `--ref <full-40-character-commit-SHA>` to install; Hermes requires an
-explicit forced install at a new SHA to move that pin. Local edits and update
-rollback are managed by Hermes, not by this plugin. A plain copied folder lacks
-Git install provenance: use the manager install flow for tracked updates.
+Import/discovery does not register this provider or start inference. Only `register(ctx)` calls `ctx.register_image_gen_provider`; Hermes owns the registration lease and its release on unload/rediscovery. Disable before remove in a running gateway and follow Hermes's reload/restart instructions. A separately running process must reload to observe removal; the remove command itself does not cancel a call already running. Select another image backend after removal if `image_gen.provider` still points to `mlx`.
 
-The optional wheel uses the same `mlx-image-gen` entry-point ID. Choose one
-installation method; remove any old `hermes_mlx_image` pip alias with
-`pip uninstall hermes-mlx-image` in the environment where it was installed before
-using the Git route. Hermes' directory `remove` does not uninstall pip packages.
+Disable/remove does not delete, move or modify the central Lemari runtime, model weights, voices or its standalone entrypoints. Other applications can continue using that same external runtime.
 
-The external wrapper keeps its own Python runtime. Before launching it, the
-plugin removes inherited `PYTHONPATH`, `PYTHONHOME`, and `VIRTUAL_ENV` from the
-child environment, preventing Hermes's Python packages from shadowing the MLX
-runtime. The child also receives `HF_HUB_OFFLINE=1` and
-`TRANSFORMERS_OFFLINE=1`; the parent environment stays unchanged. A custom wrapper
-must run inference in its own process (or replace itself with it), so the timeout
-can terminate inference and release its shared lock.
+## Supported requests
 
-## Configure
+- Text-to-image and one primary edit image via native `image_url`.
+- Local absolute image paths checked through Hermes's public file-safety API; HTTP(S) images loaded through Hermes's SSRF-safe media helper; bounded PNG/JPEG/WebP/GIF base64 image data URLs, including sandbox inputs materialized by Hermes. Input files are capped at 25 MiB and checked for a supported image header. Temporary URL/data inputs are removed after the call; caller-owned local inputs are kept.
+- Additional `reference_image_urls` are unsupported and return an error rather than being silently discarded. Upscaling and creative controls are not advertised.
+- Legacy pixel sizing via a prompt marker such as `[size=512]` or `[resolution=1024]`. Direct Python callers may also pass integer `resolution` / `size` kwargs. Sizes clamp to 256..1536 and align down to 16 pixels; aspect ratios are landscape, square and portrait. Steps remain 4 / 6 / 8 / 12 by size.
+- Stable Hermes's native creative resolution control has `1K` / `2K` semantics. This provider does not advertise that control or silently translate it into a different size. Explicit unsupported resolution values fail; unrelated future kwargs are ignored as required by the ABC.
 
-`~/.hermes/config.yaml`:
+## Central runtime contract
 
-```yaml
-plugins:
-  enabled:
-    - mlx-image-gen
+| Model key | Accepted aliases | Local subdirectory | MFlux base model | Quantize |
+|---|---|---|---|---|
+| flux2-klein-4b-4bit | flux2-klein-4b; mlx-community/FLUX.2-Klein-4B-4bit | flux2-klein-4b-4bit | flux2-klein-4b | 4 |
 
-image_gen:
-  provider: mlx
-  mlx:
-    model: flux2-klein-4b-4bit
-    models_dir: ~/.local/share/dyra-ai/models/image   # optional override
-    wrapper: ~/.local/bin/dyra-image                  # optional override
-```
+Aliases are case-insensitive. The local subdirectory is relative to `models_dir`; generation passes its resolved existing local path to `--model`, never the HF ID. Missing directories fail without a download. Model contents/tokenizer completeness must be prepared by the runtime owner.
 
-Env overrides (optional, config wins):
+The wrapper must accept MFlux arguments `--model --base-model --quantize --steps --prompt --output --width --height`; editing adds `--image-paths`. It must write a PNG at exactly the requested output path and run inference in its own PID or replace itself via exec. A custom wrapper that detaches children is outside the timeout/lock-release guarantee.
 
-```
-MLX_IMAGE_MODEL=flux2-klein-4b-4bit
-MLX_MODELS_DIR=~/.local/share/dyra-ai/models/image
-MLX_WRAPPER=~/.local/bin/dyra-image
-```
+The child receives runtime essentials, the real account home, scoped `DYRA_LOCAL_AI_LOCK_TIMEOUT` when set, and forced `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`. Hermes Python variables and arbitrary inherited credentials are not passed to it. The parent environment stays unchanged. The 1800-second subprocess timeout kills/reaps the direct wrapper process; disable/unload does not promise immediate cancellation of an existing call. Queue/lock implementation remains the external runtime's responsibility.
 
-No secrets needed. Model weights stay in the local cupboard (`~/.local/share/dyra-ai/`), never in this repo and never in `~/.hermes/`.
+Generated deliverables go to the active profile's official `cache/generated/images/` area, separate from weights and inbound media caches. Names include UUIDs. Failed/timeout attempts remove their own partial file; a successful output must be a regular non-symlink file with a PNG signature. This is a bounded header check, not a full image decode or a quality guarantee. Diagnostics omit private paths, prompts and raw subprocess output.
 
-## Local cupboard contract (the "1 lemari" rule)
+## Review and deferred testing
 
-- Canonical entrypoints: `dyra-image`, `dyra-tts`, `dyra-stt`, `dyra-f5-tts`
-- This plugin only shells out to the wrapper. Runtime/venv/model ownership stays outside Hermes.
-- Wiping `~/.hermes/` total must not touch `~/.local/`.
-- Disable/remove only changes the Hermes plugin and its activation record. Lemari's image, speech and voice assets remain usable independently.
+Version 1.0.2 was reviewed statically against original Hermes stable **0.23.2**, commit [ae2a81ccc00e9b7c06301523e5bb09608397149c](https://github.com/NousResearch/hermes-agent/commit/ae2a81ccc00e9b7c06301523e5bb09608397149c). Source syntax, metadata, public API usage and independent source review were checked in memory. No current runtime, CLI lifecycle or generation test has been executed for this release; no CI workflow was added.
 
-## Test
+Regression source in `tests/test_provider.py` and the opt-in real-host harness in `tests/test_lifecycle.py` are prepared for later execution. The harness is pinned to the reviewed stable commit and uses isolated homes when explicitly run. Historical v1.0.1 tests against a different upstream commit are not validation of v1.0.2 or this stable target.
 
-```
-python3 tests/test_provider.py
-```
-
-Offline provider tests use temporary fixtures and stubbed Hermes imports. A real
-fake executable also verifies timeout termination and lock release; no model or
-GPU is needed.
-
-The lifecycle integration check uses real Hermes source and an isolated home:
-
-```bash
-python3 tests/test_lifecycle.py --hermes-root /path/to/hermes-agent --work-dir /path/to/scratch --timeout 300
-```
-
-It exercises the official CLI's Git install, enable, disable, re-enable, update,
-and remove, plus actual provider ownership/cleanup and external asset survival.
-Use a Python environment with the Hermes CLI dependencies; enabling can provision
-the host's core runtime in the temporary home. `--manager-only` checks real
-discovery/registry cleanup without claiming a CLI or dependency-admission test.
-See `tests/test_lifecycle.py --help` for remote install verification. The contract
-was checked against upstream
-[`065f5abbb3c55d849ed7177ad5c1f231074b849a`](https://github.com/NousResearch/hermes-agent/commit/065f5abbb3c55d849ed7177ad5c1f231074b849a),
-not an unverified minimum Hermes release. Official references:
-[Plugins](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins),
-[plugin developer guide](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins),
-and [image provider guide](https://hermes-agent.nousresearch.com/docs/developer-guide/image-gen-provider-plugin).
+Official references: [Plugins](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins), [developer guide](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins), [image provider guide](https://hermes-agent.nousresearch.com/docs/developer-guide/image-gen-provider-plugin).
 
 ## License
 
