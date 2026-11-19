@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import logging
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ class ProviderTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hermes-mlx-provider-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.models = self.root / "models"
         self.local_model = self.models / "flux2-klein-4b-4bit"
         self.local_model.mkdir(parents=True)
@@ -116,8 +117,15 @@ class ProviderTests(unittest.TestCase):
         self.real_home.assert_not_called()
         self.secret_loader.assert_not_called()
         registrations = []
-        installed.register(types.SimpleNamespace(register_image_gen_provider=registrations.append))
+        hooks, tools = {}, []
+        installed.register(types.SimpleNamespace(
+            register_image_gen_provider=registrations.append,
+            register_hook=lambda name, fn: hooks.update({name: fn}),
+            register_tool=lambda **tool: tools.append(tool),
+        ))
         self.assertEqual([provider.name for provider in registrations], ["mlx"])
+        self.assertIn("pre_tool_call", hooks)
+        self.assertEqual([tool["name"] for tool in tools], ["mlx_image_generate"])
         self.config_loader.assert_not_called()
 
     def test_identity_models_aliases_and_dimensions(self):
@@ -144,6 +152,56 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(self.mod._dimensions("portrait", 512), (288, 512))
         self.assertEqual(self.mod._dimensions("square", 512), (512, 512))
         self.assertEqual([self.mod._steps_for(size) for size in (256, 512, 1024, 1536)], [4, 6, 8, 12])
+
+    def test_shared_preset_profile_defaults_and_per_request_overrides(self):
+        presets = self.root / "presets.json"
+        presets.write_text(json.dumps({
+            "daily": {"resolution": 768, "steps": 4},
+            "detail": {"resolution": 1024, "steps": 4},
+        }), encoding="utf-8")
+        self.settings.update(presets_file=str(presets), preset="daily", defaults={"aspect_ratio": "portrait"})
+        with patch.object(subprocess, "run", side_effect=self.fake_run):
+            daily = self.provider.generate("a cat")
+            explicit = json.loads(self.mod._generate_explicit(self.provider, {
+                "prompt": "a cat next to a sign reading 1200x800", "preset": "detail",
+                "aspect_ratio": "1:1", "steps": 6,
+            }))
+            later = self.provider.generate("a cat")
+        self.assertEqual((daily["width"], daily["height"], daily["steps"]), (432, 768, 4))
+        self.assertEqual((explicit["width"], explicit["height"], explicit["steps"]), (1024, 1024, 6))
+        self.assertEqual((later["width"], later["height"], later["steps"]), (432, 768, 4))
+        self.assertEqual(self.settings["preset"], "daily")
+        for key in ("width", "height", "steps"):
+            cmd = self.calls[1][0]
+            self.assertEqual(cmd[cmd.index("--" + key) + 1], str(explicit[key]))
+
+    def test_locks_apply_to_omitted_values_and_refuse_explicit_conflicts(self):
+        self.settings["locked"] = {"aspect_ratio": "9:16", "resolution": 768}
+        self.config_loader.return_value["image_gen"]["provider"] = "mlx"
+        args = {"prompt": "cat"}
+        self.assertEqual(self.mod._apply_native_aspect_default("image_generate", args), {
+            "action": "modify", "args": {"aspect_ratio": "portrait"},
+        })
+        self.assertIsNone(self.mod._apply_native_aspect_default(
+            "image_generate", {**args, "aspect_ratio": "landscape"}))
+        self.assertIsNone(self.mod._apply_native_aspect_default("other_tool", args))
+        with patch.object(subprocess, "run", side_effect=self.fake_run) as run:
+            result = self.provider.generate("cat", steps=6)
+            self.assertEqual((result["width"], result["height"], result["steps"]), (432, 768, 6))
+            for options in ({"aspect_ratio": "landscape"}, {"resolution": 512}):
+                rejected = json.loads(self.mod._generate_explicit(self.provider, {**args, **options}))
+                self.assertEqual(rejected["error_type"], "setting_locked")
+            self.assertEqual(self.provider.generate("cat [size=512]")["error_type"], "setting_locked")
+            self.assertEqual(run.call_count, 1)
+
+    def test_invalid_controls_do_not_launch_the_runtime(self):
+        with patch.object(subprocess, "run") as run:
+            for options in ({"resolution": 513}, {"steps": True}, {"steps": 13}, {"aspect_ratio": "invalid"}):
+                result = json.loads(self.mod._generate_explicit(self.provider, {"prompt": "cat", **options}))
+                self.assertEqual(result["error_type"], "invalid_request")
+            self.settings["locked"] = {"resolution": 2048}
+            self.assertEqual(self.provider.generate("cat")["error_type"], "invalid_config")
+            run.assert_not_called()
 
     def test_local_command_environment_and_unique_outputs(self):
         sentinel = {"PYTHONPATH": "/private/hermes/python", "PYTHONHOME": "/private/hermes",

@@ -89,6 +89,7 @@ def run(args):
         sys.path.insert(0, str(upstream))
         from hermes_cli.plugins import PluginManager
         from agent.image_gen_registry import get_provider
+        from tools.registry import registry
         import hermes_yaml as yaml
 
         config = {
@@ -154,6 +155,7 @@ def run(args):
         manager = PluginManager()
         manager.discover_and_load()
         assert get_provider("mlx") is None, "Disabled discovery must not register mlx"
+        assert registry.get_entry("mlx_image_generate") is None
         assert not any(str(getattr(m, "__file__", "") or "").startswith(str(installed))
                        for m in sys.modules.values()), "Disabled plugin must not be imported"
         report["passive_disabled_discovery"] = "passed"
@@ -166,9 +168,11 @@ def run(args):
         provider = get_provider("mlx")
         assert provider is not None, manager.list_plugins()
         assert provider.name == "mlx" and provider.is_available(), manager.list_plugins()
+        assert registry.get_entry("mlx_image_generate") is not None
         assert provider.list_models()[0]["local_available"] is True
         assert manager.unload(PLUGIN_ID), "Public unload must find the plugin"
         assert get_provider("mlx") is None, "Hermes must release ctx-owned registration"
+        assert registry.get_entry("mlx_image_generate") is None
         manager.discover_and_load(force=True)
         assert get_provider("mlx") is not None, manager.list_plugins()
         report["enable_and_public_unload"] = "passed"
@@ -216,6 +220,7 @@ def run(args):
         report["provider_present_before_remove_reload"] = get_provider("mlx") is not None
         manager.discover_and_load(force=True)
         assert get_provider("mlx") is None, "Removed plugin must be absent after host reload"
+        assert registry.get_entry("mlx_image_generate") is None
         assert sentinel.read_text(encoding="utf-8") == "external assets survive plugin removal"
         assert wrapper.is_file() and model.is_dir()
         report["remove_and_external_assets"] = "passed"

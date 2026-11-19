@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-mlx-image"
-version = "1.0.2"
+version = "1.0.3"
 description = "Hermes Agent local MLX image-generation provider plugin (mflux)"
 readme = "README.md"
 requires-python = ">=3.10"

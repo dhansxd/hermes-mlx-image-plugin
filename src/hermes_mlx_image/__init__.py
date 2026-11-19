@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import stat
+import json
 import subprocess
 from datetime import datetime
 from urllib.parse import urlsplit
@@ -58,9 +59,16 @@ _ALIASES: Dict[str, str] = {
 
 DEFAULT_MODELS_DIR = "~/.local/share/dyra-ai/models/image"
 DEFAULT_WRAPPER = "~/.local/bin/dyra-image"
+DEFAULT_PRESETS_FILE = "~/.local/share/dyra-ai/production/image/presets.json"
 GENERATION_TIMEOUT_SECONDS = 1800
 MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+ASPECT_RATIOS = {
+    "landscape": "landscape", "16:9": "landscape",
+    "portrait": "portrait", "9:16": "portrait",
+    "square": "square", "1:1": "square",
+}
+GENERATION_FIELDS = {"aspect_ratio", "resolution", "steps"}
 
 
 class _RequestError(ValueError):
@@ -153,7 +161,7 @@ def _resolve_entry(kwarg_model: Any, settings: Dict[str, Any]) -> tuple[str, Dic
     return key, MODEL_TABLE[key]
 
 
-def _resolution_request(prompt: str, kwargs: dict) -> tuple[str, int]:
+def _resolution_request(prompt: str, kwargs: dict, default: Optional[int] = 256) -> tuple[str, Optional[int]]:
     """Legacy pixel controls; intentionally not Hermes's native 1K/2K control."""
     raw = kwargs.get("resolution")
     if raw is None:
@@ -167,7 +175,7 @@ def _resolution_request(prompt: str, kwargs: dict) -> tuple[str, int]:
     elif raw is None and natural:
         raw = natural.group(1) or natural.group(2)
     if raw is None:
-        side = 256
+        return clean_prompt, default
     elif isinstance(raw, int) and not isinstance(raw, bool):
         side = raw
     elif isinstance(raw, str) and re.fullmatch(r"[0-9]{1,6}", raw.strip()):
@@ -188,6 +196,81 @@ def _dimensions(aspect_ratio: str, side: int) -> tuple[int, int]:
 
 def _steps_for(side: int) -> int:
     return 4 if side <= 256 else 6 if side <= 512 else 8 if side <= 1024 else 12
+
+
+def _validated_options(values: Any, source: str, error_type: str = "invalid_config") -> dict[str, Any]:
+    if not isinstance(values, dict) or values.keys() - GENERATION_FIELDS:
+        raise _RequestError(f"{source} must contain only aspect_ratio, resolution, and steps.", error_type)
+    options = dict(values)
+    if "aspect_ratio" in options:
+        raw = options["aspect_ratio"]
+        ratio = ASPECT_RATIOS.get(raw.strip().lower()) if isinstance(raw, str) else None
+        if ratio is None:
+            raise _RequestError(f"{source} aspect_ratio must be landscape, portrait, or square.", error_type)
+        options["aspect_ratio"] = ratio
+    if "resolution" in options:
+        side = options["resolution"]
+        if type(side) is not int or not 256 <= side <= 1536 or side % 16:
+            raise _RequestError(f"{source} resolution must be 256–1536 pixels in multiples of 16.", error_type)
+    if "steps" in options:
+        steps = options["steps"]
+        if type(steps) is not int or not 1 <= steps <= 12:
+            raise _RequestError(f"{source} steps must be an integer from 1 to 12.", error_type)
+    return options
+
+
+def _presets(settings: dict) -> dict:
+    path = Path(_configured_path(settings, "presets_file", "MLX_IMAGE_PRESETS_FILE", DEFAULT_PRESETS_FILE))
+    try:
+        with path.open(encoding="utf-8") as stream:
+            data = json.loads(stream.read(65537))
+    except (OSError, ValueError) as exc:
+        raise _RequestError("Cannot read the shared MLX presets file.", "invalid_config") from exc
+    if not isinstance(data, dict):
+        raise _RequestError("The shared MLX presets file must contain a mapping.", "invalid_config")
+    return data
+
+
+def _preset_options(presets: dict, name: Any, error_type: str) -> dict:
+    if not isinstance(name, str) or name not in presets:
+        available = ", ".join(sorted(presets))
+        raise _RequestError(f"MLX preset is unavailable. Available presets: {available or 'none'}.", error_type)
+    return _validated_options(presets[name], "MLX preset")
+
+
+def _generation_options(settings: dict, preset: Any, requested: dict) -> dict:
+    default_preset = settings.get("preset")
+    presets = _presets(settings) if default_preset is not None or preset is not None else {}
+    defaults = _preset_options(presets, default_preset, "invalid_config") if default_preset is not None else {}
+    defaults.update(_validated_options(settings.get("defaults", {}), "MLX defaults"))
+    overrides = _preset_options(presets, preset, "invalid_request") if preset is not None else {}
+    overrides.update(requested)
+    locked = _validated_options(settings.get("locked", {}), "MLX locks")
+    for field, value in locked.items():
+        if field in overrides and overrides[field] != value:
+            raise _RequestError(f"MLX {field} is locked to {value}. Change the profile lock to use another value.",
+                                "setting_locked")
+    return {**defaults, **overrides, **locked}
+
+
+def _mlx_selected() -> bool:
+    from hermes_cli.config import load_config
+
+    section = (load_config() or {}).get("image_gen")
+    return isinstance(section, dict) and str(section.get("provider") or "").strip().lower() == "mlx"
+
+
+def _apply_native_aspect_default(tool_name: str, args: dict, **_: Any) -> Optional[dict]:
+    """Apply the profile's aspect before the native tool fills in its own default."""
+    if tool_name != "image_generate" or args.get("aspect_ratio") is not None or not _mlx_selected():
+        return None
+    try:
+        ratio = _generation_options(_load_settings(), None, {}).get("aspect_ratio")
+    except _RequestError as exc:
+        return {"action": "block", "message": str(exc)}
+    if ratio is not None:
+        return {"action": "modify", "args": {"aspect_ratio": ratio}}
+    return None
 
 
 def _image_header(path: Path, *, output: bool = False) -> bool:
@@ -336,9 +419,11 @@ class MLXImageGenProvider(ImageGenProvider):
     def generate(
         self,
         prompt: str,
-        aspect_ratio: str = "landscape",
+        aspect_ratio: Optional[str] = None,
         image_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
+        *,
+        legacy_prompt_size: bool = True,
         **kwargs: Any,
     ) -> dict:
         """Generate/edit through the native provider contract; unknown kwargs are ignored."""
@@ -346,7 +431,8 @@ class MLXImageGenProvider(ImageGenProvider):
         output_path = None
         input_path = None
         keep_output = False
-        aspect_ratio = resolve_aspect_ratio(aspect_ratio)
+        requested_ratio = resolve_aspect_ratio(aspect_ratio) if aspect_ratio is not None else None
+        aspect_ratio = requested_ratio or "landscape"
         try:
             if not isinstance(prompt, str) or not prompt.strip():
                 raise _RequestError("An image prompt is required.", "invalid_request")
@@ -362,11 +448,20 @@ class MLXImageGenProvider(ImageGenProvider):
             local_model = Path(_models_dir(settings), entry["local_subdir"]).resolve()
             if not local_model.is_dir():
                 raise _RequestError("The configured local model directory does not exist.", "model_not_found")
-            prompt, side = _resolution_request(prompt, kwargs)
+            requested_side = kwargs.get("resolution")
+            if legacy_prompt_size:
+                prompt, requested_side = _resolution_request(prompt, kwargs, default=None)
             if not prompt.strip():
                 raise _RequestError("An image prompt is required after removing the size marker.", "invalid_request")
+            requested = {"aspect_ratio": requested_ratio, "resolution": requested_side, "steps": kwargs.get("steps")}
+            options = _generation_options(settings, kwargs.get("preset"), _validated_options(
+                {name: value for name, value in requested.items() if value is not None},
+                "MLX request", "invalid_request",
+            ))
+            aspect_ratio = options.get("aspect_ratio", "landscape")
+            side = options.get("resolution", 256)
             width, height = _dimensions(aspect_ratio, side)
-            steps = _steps_for(side)
+            steps = options.get("steps", _steps_for(side))
             sources = []
             if image_url is not None and image_url != "":
                 source, owned = _source_image(image_url)
@@ -398,6 +493,7 @@ class MLXImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect_ratio, provider=self.name,
                 modality="image" if sources else "text",
             )
+            result.update(width=width, height=height, steps=steps)
             keep_output = True
             return result
         except _RequestError as exc:
@@ -420,6 +516,48 @@ class MLXImageGenProvider(ImageGenProvider):
         )
 
 
+_TOOL_SCHEMA = {
+    "name": "mlx_image_generate",
+    "description": (
+        "Generate a new image using local FLUX.2 with user-requested resolution, steps, or a named "
+        "preset. For a standard image or editing an existing image use image_generate. Return the "
+        "result's image path as MEDIA: to deliver it. Report the actual width, height, and steps."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string", "description": "Describe the image to generate."},
+            "aspect_ratio": {"type": "string", "enum": list(ASPECT_RATIOS),
+                             "description": "Aspect ratio, or omit to use the configured default."},
+            "resolution": {"type": "integer", "minimum": 256, "maximum": 1536, "multipleOf": 16,
+                           "description": "Length of the longest side in pixels."},
+            "steps": {"type": "integer", "minimum": 1, "maximum": 12,
+                      "description": "Number of inference steps for this image."},
+            "preset": {"type": "string", "description": "Named preset in the shared local AI catalogue."},
+        },
+        "required": ["prompt"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _generate_explicit(provider: MLXImageGenProvider, args: dict, **_: Any) -> str:
+    try:
+        options = _validated_options({field: args[field] for field in GENERATION_FIELDS if field in args},
+                                     "MLX request", "invalid_request")
+    except _RequestError as exc:
+        return json.dumps(error_response(error=str(exc), error_type=exc.error_type, provider=provider.name))
+    result = provider.generate(args.get("prompt", ""), **options, preset=args.get("preset"), legacy_prompt_size=False)
+    return json.dumps(result, ensure_ascii=False)
+
+
 def register(ctx: PluginContext):
-    """Hermes owns provider registration and release via the official ledger."""
-    ctx.register_image_gen_provider(MLXImageGenProvider())
+    """Register the provider and opt-in request controls through Hermes's plugin API."""
+    provider = MLXImageGenProvider()
+    ctx.register_image_gen_provider(provider)
+    ctx.register_hook("pre_tool_call", _apply_native_aspect_default)
+    ctx.register_tool(
+        name=_TOOL_SCHEMA["name"], toolset="image_gen", schema=_TOOL_SCHEMA,
+        handler=lambda args, **kwargs: _generate_explicit(provider, args, **kwargs),
+        check_fn=lambda: _mlx_selected() and provider.is_available(), emoji="🖼️",
+    )
